@@ -64,12 +64,18 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base32"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -84,17 +90,20 @@ import (
 )
 
 var (
-	flagAdd  = flag.Bool("add", false, "add a key")
-	flagList = flag.Bool("list", false, "list keys")
-	flagHotp = flag.Bool("hotp", false, "add key as HOTP (counter-based) key")
-	flag7    = flag.Bool("7", false, "generate 7-digit code")
-	flag8    = flag.Bool("8", false, "generate 8-digit code")
-	flagClip = flag.Bool("clip", false, "copy code to the clipboard")
+	flagAdd    = flag.Bool("add", false, "add a key")
+	flagDel    = flag.Bool("del", false, "del a key")
+	flagList   = flag.Bool("list", false, "list keys")
+	flagHotp   = flag.Bool("hotp", false, "add key as HOTP (counter-based) key")
+	flag7      = flag.Bool("7", false, "generate 7-digit code")
+	flag8      = flag.Bool("8", false, "generate 8-digit code")
+	flagClip   = flag.Bool("clip", false, "copy code to the clipboard")
+	passphrase = "abc123"
 )
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage:\n")
 	fmt.Fprintf(os.Stderr, "\t2fa -add [-7] [-8] [-hotp] keyname\n")
+	fmt.Fprintf(os.Stderr, "\t2fa -del keyname\n")
 	fmt.Fprintf(os.Stderr, "\t2fa -list\n")
 	fmt.Fprintf(os.Stderr, "\t2fa [-clip] keyname\n")
 	os.Exit(2)
@@ -136,6 +145,13 @@ func main() {
 		k.add(name)
 		return
 	}
+	if *flagDel {
+		if *flagClip {
+			usage()
+		}
+		k.del(name)
+		return
+	}
 	k.show(name)
 }
 
@@ -169,7 +185,17 @@ func readKeychain(file string) *Keychain {
 
 	lines := bytes.SplitAfter(data, []byte("\n"))
 	offset := 0
-	for i, line := range lines {
+	for i, lineData := range lines {
+		lineEncrypted, err := decodeKey(string(lineData))
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if len(lineEncrypted) == 0 {
+			continue
+		}
+
+		line := decrypt(lineEncrypted)
 		lineno := i + 1
 		offset += len(line)
 		f := bytes.Split(bytes.TrimSuffix(line, []byte("\n")), []byte(" "))
@@ -250,7 +276,9 @@ func (c *Keychain) add(name string) {
 	if *flagHotp {
 		line += " " + strings.Repeat("0", 20)
 	}
-	line += "\n"
+	lineEncoded := encodeKey(encrypt([]byte(line)))
+	// line += "\n"
+	lineEncoded += "\n"
 
 	f, err := os.OpenFile(c.file, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
@@ -258,11 +286,37 @@ func (c *Keychain) add(name string) {
 	}
 	f.Chmod(0600)
 
-	if _, err := f.Write([]byte(line)); err != nil {
+	if _, err := f.Write([]byte(lineEncoded)); err != nil {
 		log.Fatalf("adding key: %v", err)
 	}
 	if err := f.Close(); err != nil {
 		log.Fatalf("adding key: %v", err)
+	}
+}
+
+func (c *Keychain) del(name string) {
+	os.Remove(c.file)
+	for i, key := range c.keys {
+		// val, _ := decodeKey(string(key.raw))
+		if name != i {
+			fmt.Println(i, encodeKey(key.raw), key.digits)
+			line := fmt.Sprintf("%s %d %s", i, key.digits, encodeKey(key.raw))
+			lineEncoded := encodeKey(encrypt([]byte(line)))
+			lineEncoded += "\n"
+
+			f, err := os.OpenFile(c.file, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+			if err != nil {
+				log.Fatalf("opening keychain: %v", err)
+			}
+			f.Chmod(0600)
+
+			if _, err := f.Write([]byte(lineEncoded)); err != nil {
+				log.Fatalf("adding key: %v", err)
+			}
+			if err := f.Close(); err != nil {
+				log.Fatalf("adding key: %v", err)
+			}
+		}
 	}
 }
 
@@ -328,6 +382,10 @@ func decodeKey(key string) ([]byte, error) {
 	return base32.StdEncoding.DecodeString(strings.ToUpper(key))
 }
 
+func encodeKey(key []byte) string {
+	return base32.StdEncoding.EncodeToString(key)
+}
+
 func hotp(key []byte, counter uint64, digits int) int {
 	h := hmac.New(sha1.New, key)
 	binary.Write(h, binary.BigEndian, counter)
@@ -342,4 +400,43 @@ func hotp(key []byte, counter uint64, digits int) int {
 
 func totp(key []byte, t time.Time, digits int) int {
 	return hotp(key, uint64(t.UnixNano())/30e9, digits)
+}
+
+func createHash(passphrase string) string {
+	hasher := md5.New()
+	hasher.Write([]byte(passphrase))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func decrypt(data []byte) []byte {
+	key := []byte(createHash(passphrase))
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err.Error())
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+	nonceSize := gcm.NonceSize()
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		panic(err.Error())
+	}
+	return plaintext
+}
+
+func encrypt(data []byte) []byte {
+	block, _ := aes.NewCipher([]byte(createHash(passphrase)))
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		panic(err.Error())
+	}
+	ciphertext := gcm.Seal(nonce, nonce, data, nil)
+	return ciphertext
 }
