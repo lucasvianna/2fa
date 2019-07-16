@@ -97,7 +97,7 @@ var (
 	flag7      = flag.Bool("7", false, "generate 7-digit code")
 	flag8      = flag.Bool("8", false, "generate 8-digit code")
 	flagClip   = flag.Bool("clip", false, "copy code to the clipboard")
-	passphrase = "abc123"
+	passphrase = "PASSPHRASE"
 )
 
 func usage() {
